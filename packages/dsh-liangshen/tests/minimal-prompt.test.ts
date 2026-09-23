@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
@@ -11,6 +11,7 @@ import {
   filePathFromExecution,
   FILE_TOUCH_TOOL_NAMES,
   filterInstructionMessages,
+  INSTRUCTION_SOURCES,
   isBaselineInstructionPath,
   isMessagePureBaseline,
   loadInstructionFiles,
@@ -18,13 +19,9 @@ import {
   name,
   PTC_SECTION_NAMES,
   renderInstructionSection,
-  WIN32_SHELL_LINE,
-  withPlatformLine,
   WORKSPACE_INSTRUCTIONS_SECTION_NAME,
 } from '../presets/liangshen/minimal-prompt.mjs'
-
-/** The persona text this runner's platform produces: the win32 shell discipline line applies on Windows. */
-const PLATFORM_LINE = process.platform === 'win32' ? WIN32_SHELL_LINE : ''
+import * as promptModule from '../presets/liangshen/minimal-prompt.mjs'
 
 type Listener = (first: any, second: any, third: any) => Promise<any>
 
@@ -159,7 +156,7 @@ describe('liangshen-minimal-prompt', () => {
   test('narrows the assembled prompt to the persona and the plan policy', async () => {
     const result = await assemble(register())
     expect(result.sections.map((section: any) => section.name)).toEqual(['deployment:persona-prefix', 'plan:policy'])
-    expect(result.sections[0].text).toBe(PERSONA.text + PLATFORM_LINE)
+    expect(result.sections[0].text).toBe(PERSONA.text)
   })
 
   test('leaves runtime contexts and tools untouched', async () => {
@@ -204,7 +201,7 @@ describe('liangshen-minimal-prompt', () => {
     const cwd = project()
     const result = await assemble(register(), FULL_SECTIONS, undefined, agentAt(cwd))
     expect(result.sections[0].text)
-      .toBe(`You are a helpful software engineer assistant.\n\nYour working directory is ${cwd}.${PLATFORM_LINE}`)
+      .toBe(`You are a helpful software engineer assistant.\n\nYour working directory is ${cwd}.`)
     // The plan policy is not orientation: it stays verbatim.
     expect(result.sections.find((section: any) => section.name === 'plan:policy').text).toBe(PLAN.text)
   })
@@ -231,14 +228,14 @@ describe('liangshen-minimal-prompt', () => {
   test('keeps the bare persona when the session reports no cwd', async () => {
     const agent = { session: { header: {} } }
     const result = await assemble(register(), FULL_SECTIONS, undefined, agent)
-    // No workspace line without a cwd; the platform line still applies on win32.
-    expect(result.sections[0].text).toBe(PERSONA.text + PLATFORM_LINE)
+    // No workspace line without a cwd: the bare persona is what remains.
+    expect(result.sections[0].text).toBe(PERSONA.text)
   })
 
   test('appends the workspace-instructions section after the stable prefix', async () => {
     writeHome('AGENTS.md', 'user-global rule')
     const cwd = project({ 'AGENTS.md': 'project rule', 'docs/AGENTS.md': 'nested rule' })
-    const result = await assemble(register(), FULL_SECTIONS, undefined, agentAt(cwd))
+    const result = await assemble(register({ instructionSource: 'system-prompt' }), FULL_SECTIONS, undefined, agentAt(cwd))
     expect(result.sections.map((section: any) => section.name)).toEqual([
       'deployment:persona-prefix',
       'plan:policy',
@@ -265,13 +262,13 @@ describe('liangshen-minimal-prompt', () => {
     // the persona/plan-policy prefix and the appended section's own text stay put.
     writeHome('AGENTS.md', 'first revision')
     const cwd = project({ 'AGENTS.md': 'project rule v1' })
-    const before = await assemble(register(), FULL_SECTIONS, undefined, agentAt(cwd))
+    const before = await assemble(register({ instructionSource: 'system-prompt' }), FULL_SECTIONS, undefined, agentAt(cwd))
     const prefixBefore = before.sections
       .filter((section: any) => section.name !== WORKSPACE_INSTRUCTIONS_SECTION_NAME)
       .map((section: any) => [section.name, section.text])
 
     writeHome('AGENTS.md', 'second revision')
-    const after = await assemble(register(), FULL_SECTIONS, undefined, agentAt(cwd))
+    const after = await assemble(register({ instructionSource: 'system-prompt' }), FULL_SECTIONS, undefined, agentAt(cwd))
     const prefixAfter = after.sections
       .filter((section: any) => section.name !== WORKSPACE_INSTRUCTIONS_SECTION_NAME)
       .map((section: any) => [section.name, section.text])
@@ -286,7 +283,7 @@ describe('liangshen-minimal-prompt', () => {
   test('renders the appended section through the harness renderer verbatim', async () => {
     writeHome('AGENTS.md', 'template example: {{evil}} and {{also_evil}}')
     const cwd = project()
-    const result = await assemble(register(), FULL_SECTIONS, undefined, agentAt(cwd))
+    const result = await assemble(register({ instructionSource: 'system-prompt' }), FULL_SECTIONS, undefined, agentAt(cwd))
     const rendered = renderPrompt({ sections: result.sections, variables: result.variables })
     expect(rendered).toContain('template example: {{evil}} and {{also_evil}}')
     expect(rendered).toContain('Your working directory is')
@@ -298,14 +295,14 @@ describe('liangshen-minimal-prompt', () => {
       'CLAUDE.md': 'project rule',
       'AGENTS.local.md': 'local override',
     })
-    const result = await assemble(register(), FULL_SECTIONS, undefined, agentAt(cwd))
+    const result = await assemble(register({ instructionSource: 'system-prompt' }), FULL_SECTIONS, undefined, agentAt(cwd))
     const text = result.variables.workspace_instructions as string
     expect(text).toContain('AGENTS.local.md')
     expect(text.match(/project rule/g)).toHaveLength(1)
   })
 
   test('sends no instruction section when no cwd, no file, or empty budget result', async () => {
-    const harness = register()
+    const harness = register({ instructionSource: 'system-prompt' })
     const bare = await assemble(harness, FULL_SECTIONS, undefined, agentAt(project()))
     expect(bare.sections.map((section: any) => section.name)).not.toContain(WORKSPACE_INSTRUCTIONS_SECTION_NAME)
     const noCwd = await assemble(harness)
@@ -314,7 +311,7 @@ describe('liangshen-minimal-prompt', () => {
 
   test('keeps reading per assembly, so file edits propagate without state', async () => {
     const cwd = project({ 'AGENTS.md': 'first rule' })
-    const harness = register()
+    const harness = register({ instructionSource: 'system-prompt' })
     const first = await assemble(harness, FULL_SECTIONS, undefined, agentAt(cwd))
     expect(first.variables.workspace_instructions).toContain('first rule')
     writeFileSync(join(cwd, 'AGENTS.md'), 'second rule')
@@ -325,7 +322,7 @@ describe('liangshen-minimal-prompt', () => {
   test('omits broadest files first when over budget, keeping the most specific', async () => {
     writeHome('AGENTS.md', 'home rule that is reasonably long '.repeat(8))
     const cwd = project({ 'AGENTS.md': 'project rule' })
-    const result = await assemble(register({ instructionMaxBytes: 600 }), FULL_SECTIONS, undefined, agentAt(cwd))
+    const result = await assemble(register({ instructionSource: 'system-prompt', instructionMaxBytes: 600 }), FULL_SECTIONS, undefined, agentAt(cwd))
     const text = result.variables.workspace_instructions as string
     expect(text).toContain('omitted $DSH_HOME/AGENTS.md')
     expect(text).toContain('project rule')
@@ -335,7 +332,7 @@ describe('liangshen-minimal-prompt', () => {
 
   test('truncates the most specific file last, at a UTF-8 boundary', async () => {
     writeHome('AGENTS.md', 'x'.repeat(2000))
-    const result = await assemble(register({ instructionMaxBytes: 800 }), FULL_SECTIONS, undefined, agentAt(project()))
+    const result = await assemble(register({ instructionSource: 'system-prompt', instructionMaxBytes: 800 }), FULL_SECTIONS, undefined, agentAt(project()))
     const text = result.variables.workspace_instructions as string
     expect(text).toContain('truncated $DSH_HOME/AGENTS.md from 2000 to')
     expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(800)
@@ -350,7 +347,7 @@ describe('liangshen-minimal-prompt', () => {
   })
 
   test('degrades to the bare prompt when the cwd cannot be probed', async () => {
-    const harness = register()
+    const harness = register({ instructionSource: 'system-prompt' })
     // A cwd whose stat probes fail (a path component is a plain file)
     // contributes no instruction section instead of failing the request.
     const file = join(homeDir, 'blocker')
@@ -370,7 +367,7 @@ describe('liangshen-minimal-prompt', () => {
   test('condenses a covered baseline injection, and drops only what the prompt already carries', async () => {
     const cwd = project()
     writeFileSync(join(cwd, 'AGENTS.md'), 'project rule', 'utf8')
-    const harness = register()
+    const harness = register({ instructionSource: 'system-prompt' })
     const agent = agentAt(cwd)
     // This assembly is what puts the baseline into the system prompt.
     await assemble(harness, FULL_SECTIONS, undefined, agent)
@@ -414,7 +411,7 @@ describe('liangshen-minimal-prompt', () => {
     const hint = result.messages[0]
     expect(hint.id).toBe('instructions-1')
     expect(hint.role).toBe('user')
-    expect(hint.source).toEqual({ kind: 'plugin', plugin: 'liangshen-minimal-prompt' })
+    expect(hint.source).toEqual({ kind: 'liangshen-minimal-prompt' })
     expect(hint.content[0].text).toContain('/repo/AGENTS.md, /repo/docs/AGENTS.md')
     expect(hint.content[0].text).toContain('not task instructions')
   })
@@ -454,6 +451,107 @@ describe('liangshen-minimal-prompt', () => {
     const third = await preStep(harness, agent, [instructionsMessage('c', ['/repo/AGENTS.md'])])
     expect(third.messages).toHaveLength(1)
     expect(third.messages[0].id).toBe('c')
+  })
+
+  describe("default 'host' instruction source", () => {
+    test('ships host first in the accepted set and accepts every listed value', () => {
+      expect(INSTRUCTION_SOURCES).toEqual(['host', 'system-prompt', 'hint'])
+      for (const source of INSTRUCTION_SOURCES) {
+        expect(() => register({ instructionSource: source })).not.toThrow()
+      }
+      expect(() => register({ instructionSource: 'hosts' })).toThrow(/instructionSource must be one of \["host","system-prompt","hint"\]/)
+    })
+
+    test('appends no workspace-instructions section in host mode', async () => {
+      writeHome('AGENTS.md', 'user-global rule')
+      const cwd = project({ 'AGENTS.md': 'project rule', 'docs/AGENTS.md': 'nested rule' })
+      const result = await assemble(register({ instructionSource: 'host' }), FULL_SECTIONS, undefined, agentAt(cwd))
+      expect(result.sections.map((section: any) => section.name)).toEqual(['deployment:persona-prefix', 'plan:policy'])
+      expect(result.variables.workspace_instructions).toBeUndefined()
+      // The persona keeps its workspace line: only the instruction section is gone.
+      expect(result.sections[0].text).toContain(`Your working directory is ${cwd}.`)
+    })
+
+    test('the config-free default is host: assembly appends nothing and pre-step returns the batch itself', async () => {
+      writeHome('AGENTS.md', 'user-global rule')
+      const cwd = project({ 'AGENTS.md': 'project rule' })
+      const harness = register()
+      const agent = agentAt(cwd)
+      const assembled = await assemble(harness, FULL_SECTIONS, undefined, agent)
+      expect(assembled.sections.map((section: any) => section.name)).toEqual(['deployment:persona-prefix', 'plan:policy'])
+      expect(assembled.variables.workspace_instructions).toBeUndefined()
+
+      const messages = [instructionsMessage('baseline-1', ['AGENTS.md'])]
+      const step = await preStep(harness, agent, messages)
+      expect(step.kind).toBe('enter')
+      // Identity, not just equality: the decision is handed back untouched.
+      expect(step.messages).toBe(messages)
+    })
+
+    test('passes baseline, marked, and dynamic agent-instructions messages through verbatim', async () => {
+      const cwd = project({ 'AGENTS.md': 'root rule' })
+      const harness = register({ instructionSource: 'host' })
+      const agent = agentAt(cwd)
+      // Loads would succeed here, so system-prompt mode would condense or drop
+      // these; host mode never looks at them.
+      await assemble(harness, FULL_SECTIONS, undefined, agent)
+
+      const plain = { id: 'user-1', role: 'user', content: [{ type: 'text', text: 'do the task' }], source: { kind: 'user' } }
+      const dynamic = {
+        id: 'dyn-1',
+        role: 'user',
+        content: [{ type: 'text', text: '<system-reminder>\nAdditional instructions from: packages/subpkg/AGENTS.md\n\nsubpackage rule\n</system-reminder>' }],
+        source: {
+          kind: 'agent-instructions',
+          form: 'instructions',
+          changes: [{ action: 'replace', scope: 'packages/subpkg\\0AGENTS.md', path: 'packages/subpkg/AGENTS.md' }],
+        },
+      }
+      const marked = {
+        id: 'base-1',
+        role: 'user',
+        content: [{ type: 'text', text: '<system-reminder>\nInstructions from: AGENTS.md\n\nroot rule\n</system-reminder>' }],
+        source: {
+          kind: 'agent-instructions',
+          form: 'instructions',
+          baseline: true,
+          baselineIdentity: 'id-baseline',
+          changes: [{ action: 'set', scope: '.\\0AGENTS.md', path: 'AGENTS.md' }],
+        },
+      }
+
+      const messages = [plain, dynamic, marked]
+      const step = await preStep(harness, agent, messages)
+      expect(step.messages).toBe(messages)
+      expect(step.messages).toEqual([plain, dynamic, marked])
+      // No condensation marker, no plugin message, no dropped entry.
+      expect(step.messages.map((message: any) => message.id)).toEqual(['user-1', 'dyn-1', 'base-1'])
+      expect(step.messages.some((message: any) => message.source?.kind === 'liangshen-minimal-prompt' || message.source?.kind === 'plugin')).toBe(false)
+      expect(step.messages[2].content[0].text).toContain('root rule')
+      expect(step.messages[2].source.baselineIdentity).toBe('id-baseline')
+      expect(step.messages[1].content[0].text).toContain('subpackage rule')
+    })
+
+    test('performs no dynamic subdirectory discovery after a tool touch', async () => {
+      const rootDir = project({
+        'AGENTS.md': 'root rule',
+        'packages/subpkg/AGENTS.md': 'subpackage rule',
+        'packages/subpkg/file.ts': 'code',
+      })
+      const harness = register({ instructionSource: 'host' })
+      const agent = agentAt(rootDir)
+      await assemble(harness, FULL_SECTIONS, undefined, agent)
+
+      listener(harness, 'tools/result')(
+        { name: 'read', arguments: { file_path: join(rootDir, 'packages/subpkg/file.ts') }, agent, token: Symbol('token') },
+        { isError: false },
+      )
+      const messages = [{ id: 'user-1', role: 'user', content: [] }]
+      const step = await preStep(harness, agent, messages)
+      // The harness's agent-instructions row owns subdirectory discovery now.
+      expect(step.messages).toBe(messages)
+      expect(step.messages).toHaveLength(1)
+    })
   })
 
   test('leaves a rejected step decision untouched', async () => {
@@ -532,7 +630,7 @@ describe('liangshen-minimal-prompt', () => {
         { name: 'tools:ptc-only', text: '`run_code` only' },
         { name: 'tools:sdk', text: sdkText },
       ]
-      const result = await assemble(register(), ptcSections, undefined, agentAt(cwd), RUN_CODE_WIRE)
+      const result = await assemble(register({ instructionSource: 'system-prompt' }), ptcSections, undefined, agentAt(cwd), RUN_CODE_WIRE)
       const rendered = renderPrompt({ sections: result.sections, variables: result.variables })
       expect(rendered).toContain(sdkText)
       expect(rendered).toContain('`run_code` only')
@@ -541,36 +639,45 @@ describe('liangshen-minimal-prompt', () => {
     })
   })
 
-  describe('win32 shell discipline line', () => {
-    test('appends the ephemeral-shell discipline to the persona on win32 only', () => {
-      const sections = [{ name: 'deployment:persona-prefix', text: PERSONA.text }]
-      const win = withPlatformLine(sections, 'win32')
-      expect(win[0].text).toBe(PERSONA.text + WIN32_SHELL_LINE)
-      expect(win[0].text).toContain('Windows (Git Bash)')
-      expect(win[0].text).toContain('do not persist across calls')
-      expect(win[0].text).toContain('cd path && command')
-      // Other platforms leave the persona untouched.
-      const linux = withPlatformLine(sections, 'linux')
-      expect(linux[0].text).toBe(PERSONA.text)
+  describe('platform-neutral persona block', () => {
+    test('exports no platform-conditional persona line', () => {
+      // The shell is upstream and persistent on BOTH platforms (bash on POSIX,
+      // pwsh on win32), so the persona block carries no shell discipline line
+      // and no platform switch: the removed win32-only surface must stay gone
+      // rather than be re-added under another name.
+      for (const removed of ['WIN32_SHELL_LINE', 'withPlatformLine']) {
+        expect(removed in promptModule, removed).toBe(false)
+      }
+      expect(promptModule.WIN32_SHELL_LINE).toBeUndefined()
+      expect(promptModule.withPlatformLine).toBeUndefined()
     })
 
-    test('does not duplicate the platform line on re-assembly', () => {
-      const once = withPlatformLine([{ name: 'deployment:persona-prefix', text: PERSONA.text }], 'win32')
-      const twice = withPlatformLine(once, 'win32')
-      expect(twice[0].text).toBe(once[0].text)
-      expect(twice[0].text.split('Current platform: Windows (Git Bash).').length - 1).toBe(1)
-    })
-
-    test('appends the platform line after the workspace line in the assembled prompt', async () => {
+    test('produces the same persona text on win32 and on POSIX', async () => {
+      // The assembled prompt is a pure function of the session cwd, so the two
+      // platforms cannot diverge: nothing in the persona depends on the host.
       const cwd = project()
       const result = await assemble(register(), FULL_SECTIONS, undefined, agentAt(cwd))
       const text = result.sections[0].text
-      if (process.platform === 'win32') {
-        expect(text).toContain(`Your working directory is ${cwd}.`)
-        expect(text.indexOf('Your working directory is')).toBeLessThan(text.indexOf('Current platform: Windows (Git Bash).'))
-      } else {
-        expect(text).not.toContain('Current platform: Windows')
-      }
+      expect(text).toBe(`You are a helpful software engineer assistant.\n\nYour working directory is ${cwd}.`)
+      expect(text).not.toContain('Current platform')
+      expect(text).not.toContain('Git Bash')
+      expect(text).not.toContain('ephemeral')
+      // The persona stays the workspace line plus the shipped discipline only:
+      // no third appended paragraph.
+      expect(text.split('\n\n')).toHaveLength(2)
+    })
+
+    test('carries no platform-conditional code on the prompt-assembly path', () => {
+      // The regression guard the removed line needs: a future platform append
+      // would reintroduce a host-dependent system prompt. Assert at the source
+      // level, because the tests themselves run on only ONE platform.
+      const source = readFileSync(
+        join(process.cwd(), 'presets/liangshen/minimal-prompt.mjs'),
+        'utf8',
+      )
+      expect(source).not.toContain('process.platform')
+      expect(source).not.toMatch(/win32/)
+      expect(source).not.toMatch(/Git Bash/)
     })
   })
 
@@ -594,7 +701,7 @@ describe('liangshen-minimal-prompt', () => {
         'packages/subpkg/AGENTS.md': 'subpackage rule',
         'packages/subpkg/file.ts': 'code',
       })
-      const harness = register()
+      const harness = register({ instructionSource: 'system-prompt' })
       const agent = agentAt(rootDir)
 
       await assemble(harness, FULL_SECTIONS, undefined, agent)
@@ -608,7 +715,7 @@ describe('liangshen-minimal-prompt', () => {
       listener(harness, 'tools/result')(exec, { isError: false })
 
       const step = await preStep(harness, agent, [{ id: 'user-1', role: 'user', content: [] }])
-      expect(step.messages.some((m: any) => m.source?.kind === 'plugin' && m.content[0]?.text?.includes('subpackage rule'))).toBe(true)
+      expect(step.messages.some((m: any) => m.source?.kind === 'liangshen-minimal-prompt' && m.content[0]?.text?.includes('subpackage rule'))).toBe(true)
     })
 
     test('does not record touched directory for failed or aborted tool executions', async () => {
@@ -616,7 +723,7 @@ describe('liangshen-minimal-prompt', () => {
         'packages/subpkg/AGENTS.md': 'subpackage rule',
         'packages/subpkg/file.ts': 'code',
       })
-      const harness = register()
+      const harness = register({ instructionSource: 'system-prompt' })
       const agent = agentAt(rootDir)
       await assemble(harness, FULL_SECTIONS, undefined, agent)
 
@@ -626,7 +733,7 @@ describe('liangshen-minimal-prompt', () => {
         { isError: true },
       )
       const step1 = await preStep(harness, agent, [{ id: 'user-1', role: 'user', content: [] }])
-      expect(step1.messages.some((m: any) => m.source?.kind === 'plugin')).toBe(false)
+      expect(step1.messages.some((m: any) => m.source?.kind === 'liangshen-minimal-prompt' || m.source?.kind === 'plugin')).toBe(false)
 
       // Aborted execution
       const abortCtrl = new AbortController()
@@ -636,7 +743,7 @@ describe('liangshen-minimal-prompt', () => {
         { isError: false },
       )
       const step2 = await preStep(harness, agent, [{ id: 'user-2', role: 'user', content: [] }])
-      expect(step2.messages.some((m: any) => m.source?.kind === 'plugin')).toBe(false)
+      expect(step2.messages.some((m: any) => m.source?.kind === 'liangshen-minimal-prompt' || m.source?.kind === 'plugin')).toBe(false)
     })
 
     test('reconstructs touched directories from durable session history on replay', async () => {
@@ -645,7 +752,7 @@ describe('liangshen-minimal-prompt', () => {
         'packages/replayed/AGENTS.md': 'replayed subpackage rule',
         'packages/replayed/file.ts': 'code',
       })
-      const harness = register()
+      const harness = register({ instructionSource: 'system-prompt' })
       const pastEvents = [
         {
           type: 'tool/call',
@@ -670,7 +777,7 @@ describe('liangshen-minimal-prompt', () => {
   describe('dynamic subdirectory instruction reconciliation', () => {
     test('condenses pure covered baseline message into concise legal message when baseline is loaded', async () => {
       const rootDir = project({ 'AGENTS.md': 'root rule' })
-      const harness = register()
+      const harness = register({ instructionSource: 'system-prompt' })
       const agent = agentAt(rootDir)
       await assemble(harness, FULL_SECTIONS, undefined, agent)
 
@@ -700,7 +807,7 @@ describe('liangshen-minimal-prompt', () => {
     })
 
     test('passes through baseline message when baseline loading failed', async () => {
-      const harness = register()
+      const harness = register({ instructionSource: 'system-prompt' })
       const agent = agentAt('/nonexistent/path/for/failure')
 
       const pureBaselineMsg = {
@@ -725,7 +832,7 @@ describe('liangshen-minimal-prompt', () => {
     })
 
     test('retains dynamic update and removal instructions', async () => {
-      const harness = register()
+      const harness = register({ instructionSource: 'system-prompt' })
       const agent = agentOf()
 
       const updateMsg = {
@@ -816,7 +923,7 @@ describe('liangshen-minimal-prompt', () => {
         'packages/subpkg/AGENTS.md': 'subpackage specific rule',
         'packages/subpkg/file.ts': 'export const a = 1;',
       })
-      const harness = register()
+      const harness = register({ instructionSource: 'system-prompt' })
       const agent = agentAt(rootDir)
 
       // Turn 1: System prompt assemble carries root repo rule residently
@@ -859,7 +966,7 @@ describe('liangshen-minimal-prompt', () => {
       // Turn 2 Pre-step: Discovers package-level AGENTS and delivers legal plugin message
       const turn2Step = await preStep(harness, agent, [{ id: 'user-turn-2', role: 'user', content: [] }])
       expect(turn2Step.messages.length).toBeGreaterThanOrEqual(2)
-      const dynamicPluginMsg = turn2Step.messages.find((m: any) => m.source?.kind === 'plugin')
+      const dynamicPluginMsg = turn2Step.messages.find((m: any) => m.source?.kind === 'liangshen-minimal-prompt')
       expect(dynamicPluginMsg).toBeDefined()
       expect(dynamicPluginMsg.content[0].text).toContain('Additional instructions from: packages/subpkg/AGENTS.md')
       expect(dynamicPluginMsg.content[0].text).toContain('subpackage specific rule')
@@ -867,7 +974,7 @@ describe('liangshen-minimal-prompt', () => {
 
     test('compaction recovery preserves baseline system prompt and recovers state', async () => {
       const rootDir = project({ 'AGENTS.md': 'persistent root rule' })
-      const harness = register()
+      const harness = register({ instructionSource: 'system-prompt' })
       const agent = agentAt(rootDir)
 
       const firstAssembly = await assemble(harness, FULL_SECTIONS, undefined, agent)
